@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use tauri::{
     AppHandle, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
 };
@@ -14,7 +15,7 @@ const MINIMAL_PANEL_HEIGHT: f64 = 350.0;
 const MIN_PANEL_HEIGHT: f64 = 200.0;
 
 /// 内容驱动的高度缓动动画时长 / 帧间隔（开窗前的 fit 不动画，见 fit 的 animate 参数）。
-/// 帧间隔 4ms（60 次 set_size/250ms，与 240Hz 高分屏刷新率对齐；2026-09-08 领导实机对比
+/// 帧间隔 4ms（60 次原子 SetWindowPos/250ms，与 240Hz 高分屏刷新率对齐；2026-09-08 领导实机对比
 /// 瞬时/30Hz/68Hz/100 次各档后拍板 60 次档——100 次档无可见增益且排版调用多 67%）：
 /// tokio sleep 在 Windows 被定时器精度（~15.6ms）限到 ~68Hz（实测 13 步/188ms），
 /// 故帧 pacing 用自旋等绝对时刻表——自旋总量 4ms×~60 次/动画、仅沉降/静息收矮触发
@@ -71,6 +72,16 @@ struct MonitorGeom {
     h: i32,
 }
 
+/// 把 tauri 显示器句柄快照成帧内复用的纯几何（物理像素）。
+fn monitor_geom(monitor: &tauri::Monitor) -> MonitorGeom {
+    MonitorGeom {
+        x: monitor.position().x,
+        y: monitor.position().y,
+        w: monitor.size().width as i32,
+        h: monitor.size().height as i32,
+    }
+}
+
 /// 逻辑高 → 物理像素：×缩放比后四舍五入取整（喂给 set_size(Size::Physical)，
 /// 消除逻辑小数经 DPI 缩放产生的亚像素颤动），保底 1px 防 0 高窗口。
 fn frame_height_px(h_logical: f64, scale: f64) -> u32 {
@@ -114,6 +125,82 @@ fn should_debounce_target(in_flight_bits: u64, new_target: f64) -> bool {
 fn clear_anim_target_if_mine(target_h: f64) {
     if RESIZE_ANIM_TARGET.load(Ordering::SeqCst) == target_h.to_bits() {
         RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
+    }
+}
+
+/// 面板窗口「尺寸 + 位置」的串行锁：原子 SetWindowPos 直接生效、绕过 Tauri 主线程消息
+/// 队列的 FIFO 保护，瞬时到位与在播动画帧可能跨线程并发改同一窗口，必须互斥——
+/// 临界区 = 锁内「序号检查（或顶号）+ 设置」成对完成，旧帧不可能覆盖新结果。
+static PANEL_WIN_LOCK: Mutex<()> = Mutex::new(());
+
+/// 取锁（中毒仅发生在持锁 panic，窗口句柄操作不会 panic，继续用即可）。
+fn lock_panel_win() -> MutexGuard<'static, ()> {
+    PANEL_WIN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 窗口外框与客户区在宽/高上的差值（物理像素）。
+/// Windows 无边框 + 阴影窗口带隐藏偏移（tao `undecorated_with_shadows`），因此
+/// `set_size`（inner 语义）与 `set_position`（outer 语义）不能混用同一套尺寸：
+/// 锚定与 SetWindowPos 的 cx/cy 一律用外框尺寸，inner 目标值只在算外框时加回差值。
+fn outer_frame_extra(window: &WebviewWindow) -> (i32, i32) {
+    let (Ok(inner), Ok(outer)) = (window.inner_size(), window.outer_size()) else {
+        return (0, 0);
+    };
+    (
+        outer.width.saturating_sub(inner.width) as i32,
+        outer.height.saturating_sub(inner.height) as i32,
+    )
+}
+
+/// 面板窗口尺寸 + 位置统一出口（物理像素）：
+/// - Windows 走单条 `SetWindowPos(hwnd, x, y, outer_w, outer_h)`，位置与尺寸原子生效，
+///   消除「先 set_size（顶边锚定向下长出）再 set_position（上移做底边锚定）」两条异步
+///   消息之间的错位中间态（切到高页时底边会短暂冲过托盘图标，跨 vblank 即渲染成跳动）；
+/// - 拿不到 HWND / 非 Windows 回退 Tauri 两步 API（语义等价，仅多一条消息）。
+///
+/// `inner_w/inner_h` 是客户区目标尺寸，`extra` 是实测外框差（见 `outer_frame_extra`）；
+/// 调用方必须先持 `PANEL_WIN_LOCK`（锁内成对完成「查序号/顶号 + 设置」）。
+fn apply_inner_size_pos(
+    window: &WebviewWindow,
+    x: i32,
+    y: i32,
+    inner_w: i32,
+    inner_h: i32,
+    extra: (i32, i32),
+) {
+    #[cfg(windows)]
+    if set_window_size_pos_once(window, x, y, inner_w + extra.0, inner_h + extra.1) {
+        return;
+    }
+    let _ = window.set_size(Size::Physical(PhysicalSize::new(
+        inner_w.max(1) as u32,
+        inner_h.max(1) as u32,
+    )));
+    let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+}
+
+/// Windows：单条 SetWindowPos 同时给定位置与外框尺寸（物理像素），成功返回 true。
+#[cfg(windows)]
+fn set_window_size_pos_once(window: &WebviewWindow, x: i32, y: i32, w_px: i32, h_px: i32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER,
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
+    // SAFETY: hwnd 为本进程活动窗口句柄；SWP_NOZORDER 不动 Z 序（alwaysOnTop 由窗口
+    // 样式保持，不受影响）、SWP_NOACTIVATE 不抢焦点；x/y/cx/cy 均为调用方钳进屏幕
+    // 范围的物理像素值。
+    unsafe {
+        SetWindowPos(
+            hwnd.0,
+            HWND_TOP,
+            x,
+            y,
+            w_px.max(1),
+            h_px.max(1),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        ) != 0
     }
 }
 
@@ -161,8 +248,9 @@ fn effective_panel_height(config_height: f64, monitor_height_px: u32, monitor_sc
 /// 面板内容高度，自适应主路径），未实测过时回退到基准高（极简紧凑高/配置高），
 /// 并在显示器可用高度内取小（小屏压高）。
 /// 全程只用逻辑像素 + 托盘所在显示器的缩放比：此时窗口可能还停在别的显示器上，
-/// `window.scale_factor()` 是错的；也不把量到的窗口尺寸喂回去（outer_size 与
-/// `set_size(Size::Physical)` 单位语义不一致会把窗口越撑越宽，面板两侧露白边）。
+/// `window.scale_factor()` 是错的；也不把量到的窗口尺寸直接喂回 set_size（set_size 是
+/// inner 语义、回读值语义混用会累加偏差把窗口越撑越宽，面板两侧露白边）——尺寸仍从
+/// conf/内容高推导，回读值只用于算外框与客户区的固定差（见 `outer_frame_extra`）。
 fn fit_panel_to_screen(app: &AppHandle, window: &WebviewWindow, tray: TrayRect, animate: bool) {
     let Some(conf) = app.config().app.windows.iter().find(|w| w.label == "main") else {
         return;
@@ -196,10 +284,24 @@ fn fit_panel_to_screen(app: &AppHandle, window: &WebviewWindow, tray: TrayRect, 
     if !animate {
         // 瞬时到位必须先作废在播的高度动画：否则在播缓动的后续帧会把瞬时结果覆盖回去
         // （issue #48 第二轮实机取证抓到：上一翻沉降触发的收矮缓动尾帧把下一翻的
-        // 瞬时长高拖回矮值，高页被裁着滑完、沉降后再弹回——窗口高度乱抖的卡顿本体）
+        // 瞬时长高拖回矮值，高页被裁着滑完、沉降后再弹回——窗口高度乱抖的卡顿本体）。
+        // 顶号与设置在同一临界区：原子 SetWindowPos 绕过消息队列 FIFO，旧帧晚到会覆盖
+        // 正确结果；锁内先顶号，旧帧下一帧复查序号必退出。
+        // 尺寸 + 位置走单条 SetWindowPos 原子生效，锚定用外框尺寸（set_position 是
+        // outer 坐标），与动画帧同一基准，消除「长高走瞬时、收矮走动画」各跳一个边框差。
+        let w_px = frame_height_px(conf.width, scale) as i32;
+        let h_px = frame_height_px(target_h, scale) as i32;
+        let extra = outer_frame_extra(window);
+        let (x, y) = anchored_panel_pos(
+            tray,
+            Some(monitor_geom(&monitor)),
+            w_px + extra.0,
+            h_px + extra.1,
+        );
+        let _guard = lock_panel_win();
         RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst);
         RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
-        let _ = window.set_size(Size::Logical(LogicalSize::new(conf.width, target_h)));
+        apply_inner_size_pos(window, x, y, w_px, h_px, extra);
         return;
     }
     animate_height_to(app, window, tray, conf.width, target_h);
@@ -209,9 +311,10 @@ fn fit_panel_to_screen(app: &AppHandle, window: &WebviewWindow, tray: TrayRect, 
 /// 新的调用顶掉进行中的动画（序号失效即退出，下一次从实时高度重新起步，可中断）；
 /// 与在播目标差 < 4 逻辑 px 的新目标被防抖忽略（不顶号、不重启，吸收测高抖动）；
 /// 面板中途被隐藏则让出（下次 show 时 fit 会一次性校准）。
-/// 消卡顿：托盘 rect / 显示器几何与缩放比 / 起点高在启动时快照一次，循环体内零系统
-/// 查询——每帧只剩纯数学（缓动 + 物理取整 + 锚定翻转/clamp）+ set_size / set_position
-/// 两次系统调用；物理像素取整消除亚像素颤动。
+/// 消卡顿：托盘 rect / 显示器几何与缩放比 / 起点高 / 外框差值在启动时快照一次，循环体内
+/// 零系统查询——每帧只剩纯数学（缓动 + 物理取整 + 锚定翻转/clamp）+ 一次原子
+/// SetWindowPos（尺寸与位置同条消息，无「先 resize 再 move」的错位中间态）；
+/// 物理像素取整消除亚像素颤动。
 fn animate_height_to(
     app: &AppHandle,
     window: &WebviewWindow,
@@ -221,24 +324,30 @@ fn animate_height_to(
 ) {
     // 启动时快照：托盘所在显示器的几何与缩放比（fit 已保证取得到；取不到则瞬时到位兜底）
     let Ok(Some(monitor)) = app.monitor_from_point(tray.x as f64, tray.y as f64) else {
+        // 无显示器信息无法定位，只能设尺寸；同样要顶号，防旧帧把这次结果覆盖回去
+        let _guard = lock_panel_win();
+        RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst);
+        RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
         let _ = window.set_size(Size::Logical(LogicalSize::new(width, target_h)));
         return;
     };
     let scale = monitor.scale_factor();
-    let mon = MonitorGeom {
-        x: monitor.position().x,
-        y: monitor.position().y,
-        w: monitor.size().width as i32,
-        h: monitor.size().height as i32,
-    };
+    let mon = monitor_geom(&monitor);
     // 起点高快照（读值仅此一次，不喂回）
     let start_h = window
         .inner_size()
         .map(|s| s.height as f64 / scale)
         .unwrap_or(target_h);
-    // 起点即目标：不动画，宽度顺带兜底校准
+    // 起点即目标：不动画，宽度顺带兜底校准（原子设置 + 顶号，与瞬时路径同语义）
     if (start_h - target_h).abs() < 2.0 {
-        let _ = window.set_size(Size::Logical(LogicalSize::new(width, target_h)));
+        let w_px = frame_height_px(width, scale) as i32;
+        let h_px = frame_height_px(target_h, scale) as i32;
+        let extra = outer_frame_extra(window);
+        let (x, y) = anchored_panel_pos(tray, Some(mon), w_px + extra.0, h_px + extra.1);
+        let _guard = lock_panel_win();
+        RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst);
+        RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
+        apply_inner_size_pos(window, x, y, w_px, h_px, extra);
         return;
     }
     // 目标防抖：动画进行中收到与在播目标差 < 4 逻辑 px 的新目标 → 忽略（不顶序号、不重播）
@@ -248,8 +357,10 @@ fn animate_height_to(
     let seq = RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     RESIZE_ANIM_TARGET.store(target_h.to_bits(), Ordering::SeqCst);
     let win = window.clone();
-    // 宽度恒定（conf 逻辑宽不变）：物理宽启动时算一次，帧内复用
+    // 宽度恒定（conf 逻辑宽不变）：物理宽启动时算一次，帧内复用；
+    // 外框差值同样快照（阴影边框不随窗口尺寸变），避免帧内读窗口尺寸
     let win_w = frame_height_px(width, scale) as i32;
+    let extra = outer_frame_extra(window);
     tauri::async_runtime::spawn(async move {
         let start = std::time::Instant::now();
         let frame = std::time::Duration::from_millis(RESIZE_FRAME_MS);
@@ -262,17 +373,21 @@ fn animate_height_to(
             let t = (start.elapsed().as_millis() as f64 / RESIZE_ANIM_MS as f64).min(1.0);
             let h = start_h + (target_h - start_h) * ease_out_cubic(t);
             let h_px = frame_height_px(h, scale);
-            // 底边锚定纯算术：翻转/clamp 用缓存常量每帧重判（翻转可能随高度变化中途触发）
-            let (x, y) = anchored_panel_pos(tray, Some(mon), win_w, h_px as i32);
-            // 发帧前再核一次序号：顶部检查到 set_size 之间若被瞬时 set_size（animate=false
-            // 分支会作废旧动画）顶号，这一帧就是覆盖正确结果的「陈帧」（实机抓到：
-            // 收矮动画最后一帧把预长结果拖回矮值，直到下次终审才纠正）
+            // 底边锚定纯算术：翻转/clamp 用缓存常量每帧重判（翻转可能随高度变化中途触发）；
+            // 尺寸一律用外框（inner + extra），与 set_position 的 outer 坐标语义对齐
+            let (x, y) =
+                anchored_panel_pos(tray, Some(mon), win_w + extra.0, h_px as i32 + extra.1);
+            // 发帧前再核一次序号（锁内成对）：原子 SetWindowPos 绕过消息队列 FIFO，
+            // 顶部检查到设置之间若被瞬时到位（animate=false 会顶号）抢跑，这一帧就是
+            // 覆盖正确结果的「陈帧」（实机抓到：收矮动画最后一帧把预长结果拖回矮值）
+            let guard = lock_panel_win();
             if RESIZE_ANIM_SEQ.load(Ordering::SeqCst) != seq {
+                drop(guard);
                 clear_anim_target_if_mine(target_h);
                 return;
             }
-            let _ = win.set_size(Size::Physical(PhysicalSize::new(win_w as u32, h_px)));
-            let _ = win.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+            apply_inner_size_pos(&win, x, y, win_w, h_px as i32, extra);
+            drop(guard);
             if t >= 1.0 {
                 clear_anim_target_if_mine(target_h);
                 break;
@@ -305,8 +420,8 @@ pub fn refit_open_panel(app: &AppHandle, animate: bool) {
         return; // 取不到托盘位置：不动，下次打开面板时自然会校准
     };
     fit_panel_to_screen(app, &window, tray, animate);
-    // 高度变化后按托盘位置重定位（否则压矮后面板下沿悬空、恢复后可能出屏）；
-    // animate=true 时此行是第 0 帧定位，后续帧由 animate_height_to 逐帧锚定
+    // 瞬时路径已在 fit 内原子完成「尺寸 + 位置」；这里再定位一次是幂等兜底
+    // （尺寸未变 / 动画在播时 position_panel 会自行让路，不会与首帧交叉）
     position_panel(app, &window, tray);
 }
 
@@ -329,22 +444,27 @@ pub fn show_panel_for_second_instance(app: &AppHandle) {
 }
 
 /// 把面板定位到托盘图标上方、水平居中对齐，并裁剪到所在显示器范围内。
-/// 系统查询（窗口尺寸 / 显示器几何）只在此处发生一次，翻转与 clamp 数学走
-/// anchored_panel_pos 纯函数（与动画帧内共用同一套规则）。
+/// 锚定用外框尺寸（`set_position` 是 outer 坐标，与动画帧同一基准）；系统查询只在此处
+/// 发生一次，翻转与 clamp 数学走 anchored_panel_pos 纯函数。
 fn position_panel(app: &AppHandle, window: &WebviewWindow, tray: TrayRect) {
-    let size = window.outer_size().unwrap_or_default();
+    // 读不到外框尺寸就不动：绝不能按 0×0 锚定（那会把窗口顶边锚到托盘上方 8px、
+    // 主体盖住托盘图标，比保持原位更糟）；下次 show/refit 会重新校准。
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
     let (win_w, win_h) = (size.width as i32, size.height as i32);
     let mon = app
         .monitor_from_point(tray.x as f64, tray.y as f64)
         .ok()
         .flatten()
-        .map(|m| MonitorGeom {
-            x: m.position().x,
-            y: m.position().y,
-            w: m.size().width as i32,
-            h: m.size().height as i32,
-        });
+        .map(|m| monitor_geom(&m));
     let (x, y) = anchored_panel_pos(tray, mon, win_w, win_h);
+    let _guard = lock_panel_win();
+    // 在播高度动画每帧都会重定位：此处让路，避免「第 0 帧按当前尺寸定位、首帧按
+    // 目标尺寸锚定」交叉造成的一帧跳动（动画结束会清 target，后续定位照常）。
+    if RESIZE_ANIM_TARGET.load(Ordering::SeqCst) != 0 {
+        return;
+    }
     let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
 }
 
