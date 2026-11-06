@@ -306,10 +306,10 @@ fn apply_inner_size_pos(
 /// 几何未变化时短路返回（切页热路径零系统调用）。
 #[cfg(windows)]
 fn set_window_size_pos_once(window: &WebviewWindow, x: i32, y: i32, w_px: i32, h_px: i32) -> bool {
+    use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowRect, SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER,
     };
-    use windows_sys::Win32::Foundation::RECT;
     let Some(hwnd) = panel_hwnd(window) else {
         return false;
     };
