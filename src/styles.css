@@ -41,6 +41,15 @@
   --ok-bg: rgba(158, 206, 106, 0.12);
   --warn: #e0af68;
   --shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  /* 面板自绘外框：窗口被 SetWindowRgn 裁成自定义形状后 DWM 不再画阴影，由 .panel 补回。
+     --panel-frame 与后端 FRAME_PAD（8 逻辑 px）必须一致：窗口四周各留这一圈。
+     阴影只能画在透明窗口内（窗口 tint 到 pad 区即为黑边），见 html.panel-window。 */
+  --panel-frame: 8px;
+  /* 第一层 1px 半透明白描边复刻原生 DWM 亮边（0.07 在深色壁纸上几乎不可见，提到 0.18）；
+     第二层顶部内高光模拟 Win11 窗口上沿更亮的观感；后两层是外阴影 */
+  --panel-frame-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 2px 8px rgba(0, 0, 0, 0.5),
+    0 0 6px rgba(0, 0, 0, 0.35);
   /* 自定义背景图上的遮罩（深色：主题底色 45% 透明），压图保卡片文字可读 */
   --bg-scrim: rgba(26, 27, 38, 0.45);
   /* 关键数字的等宽遥测字体（百分比/金额/token 数）：Cascadia 随 Win11 与 Terminal 预装，
@@ -77,6 +86,10 @@
   --prov-deepseek: #7c3aed;
   --prov-glm: #0f766e;
   --shadow: 0 2px 8px rgba(31, 35, 40, 0.08);
+  /* 浅色主题外框：描边压暗、阴影降饱和，避免深色阴影糊在浅底上；顶部内高光提亮复刻原生 */
+  --panel-frame-shadow: 0 0 0 1px rgba(31, 35, 40, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6), 0 2px 8px rgba(31, 35, 40, 0.18),
+    0 0 6px rgba(31, 35, 40, 0.1);
   /* 浅色主题对应的背景遮罩（浅色底 45% 透明） */
   --bg-scrim: rgba(245, 246, 250, 0.45);
 }
@@ -100,20 +113,56 @@ body,
   height: 100%;
 }
 
+/* 面板窗口 transparent + SetWindowRgn 裁剪（index.html 的 .panel-window）：
+   页面背景必须全透明，否则 WebView2 会用主题底色（:root 的 --bg）填满 .panel 四周
+   留给自绘阴影的 --panel-frame 圈 —— 那圈阴影区就变成实心深色"黑边"。
+   设置页（settings.html）是不透明窗口，不加该 class，:root 底色照常生效。 */
+html.panel-window,
+html.panel-window body {
+  background: transparent;
+}
+
+#root {
+  /* 面板绝对定位的包含块：窗口视口固定为最大高度，.panel 贴底上一圈（--panel-frame）留阴影 */
+  position: relative;
+}
+
 /* ===== 用量面板 ===== */
 
-/* 面板根容器：360px 宽、纵向排列；多账号翻页后由各页（.page）自己纵向滚动，容器不滚 */
+/* 面板根容器：360px 宽、纵向排列；多账号翻页后由各页（.page）自己纵向滚动，容器不滚。
+   B 方案：窗口高度固定，面板贴视口底部、自身 height 用 300ms 过渡（与后端 region 动画
+   同曲线）——底栏屏幕位置锚在固定的窗口底，不再受 WebView2 resize 滞后影响。
+   自绘外框：窗口 transparent + 四周各留 --panel-frame 一圈（后端 region 同步留边），
+   阴影由 box-shadow 画在面板与窗口边界之间；面板底边距窗口底一圈，因此仍距托盘原间距。
+   ⚠️ 窗口必须 transparent（tauri.conf.json）：不透明 WebView2 会把这一圈填成 --bg，
+   阴影就退化成实心黑边（见下方 html.panel-window 规则）。 */
 .panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: var(--panel-frame);
   width: 360px;
   max-width: 100vw;
-  height: 100%;
+  height: var(--panel-h, calc(100% - 16px));
   margin: 0 auto;
   padding: 10px 12px 8px;
   display: flex;
   flex-direction: column;
   gap: 10px;
   overflow: hidden;
+  /* 与后端圆角 region（8 逻辑 px）一致：窗口区域裁剪后内容边缘不露直角 */
+  border-radius: 8px;
   background-color: var(--bg);
+  box-shadow: var(--panel-frame-shadow);
+  /* 300ms + 轻微过冲（back-out 约 2%，峰值在 68% 时刻）：前段够快、过冲后留足回落时间。
+     过冲不能快——200ms 内冲过再弹回会像"抽搐"；300ms 让回落舒展。后端 region 动画严格
+     同曲线同时长（panel.rs RESIZE_ANIM_MS / ease_out_back），两端必须一起改，否则错位 */
+  transition: height 300ms cubic-bezier(0.3, 1.25, 0.6, 1);
+}
+
+/* 瞬时到位（开窗校准 / 切页期高度冻结）：同一帧直接跳高度，不播过渡 */
+html.panel-instant .panel {
+  transition: none;
 }
 
 /* --- 多账号翻页（像手机桌面：横向滑动，到头停不循环） --- */
@@ -162,12 +211,19 @@ body,
 }
 
 /* 页内容器：承载内容流（gap 从 .page 移入）；fit-content 高度供窗口自适应测量；
-   margin 上下 auto 使矮内容（空态/加载态/短页）在页内垂直居中 */
+   只有上边距 auto → 矮内容贴底（内容底部贴圆点上方）。窗口高度变化（预长/收矮）时
+   底边固定、只有顶部伸缩，内容不再随居中偏移上下浮动；内容超高时 auto 失效退回
+   顶部对齐并页内滚动。若更希望页头稳定在顶部，把 margin 改成 0 即可（贴顶）。 */
 .page-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin: auto 0;
+  margin: auto 0 0;
+  /* 禁止被 .page（flex column）压缩：面板高度小于内容时，默认 flex-shrink:1 会把
+     page-body 压到容器高，pageDesiredHeight 测到的就是"当前面板高"而不是内容真实高——
+     高度会自稳定在错误的小值，页头/卡片顶部被裁。0 0 auto 让内容恒为真实高，
+     溢出交给 .page 的 overflow-y 滚动消化（滚动条由 panel-resizing/sliding 临时隐藏）。 */
+  flex: 0 0 auto;
 }
 
 /* 翻页滑动期间藏起页内滚动条：窗口压矮若落在动画途中，正在滑出的高页会短暂溢出（滚动条一闪而过）；
@@ -175,6 +231,12 @@ body,
 .pager-track.sliding .page {
   overflow: hidden;
   content-visibility: visible;
+}
+
+/* 高度过渡期间（panel.tsx 的 applyHeight 直写 html.panel-resizing，260ms）：切页/数据到达时
+   容器高度尚未到位，页内容可能短暂溢出——藏起滚动条，长高/收矮过程不闪滚动条 */
+html.panel-resizing .page {
+  overflow: hidden;
 }
 
 /* 当前页恒真实渲染（静止期唯一不做内容跳过的页，测高/交互都发生在它身上） */

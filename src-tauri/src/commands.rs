@@ -705,10 +705,12 @@ pub fn get_panel_state(state: State<'_, AppState>) -> PanelState {
 
 /// 前端实测的面板内容高度（逻辑像素）：记忆到 AppState（show 时 fit 用它做基准），
 /// 面板开着时立即重排。高度变化 <0.5px 时跳过防抖。
-/// animate=false（减少动态模式）瞬时到位；true 走 250ms 缓动动画。
+/// animate=false（减少动态模式）瞬时到位；true 走 300ms back-out 缓动动画。
 #[tauri::command]
 pub fn set_panel_content_height(app: AppHandle, height: f64, animate: bool) {
-    if app.state::<AppState>().set_panel_content_height(height) {
+    let changed = app.state::<AppState>().set_panel_content_height(height);
+    tracing::debug!("panel height report: {height:.1} animate={animate} changed={changed}");
+    if changed {
         crate::panel::refit_open_panel(&app, animate);
     }
 }

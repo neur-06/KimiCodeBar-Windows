@@ -18,11 +18,12 @@
         "height": 840,
         "url": "index.html",
         "decorations": false,
+        "transparent": true,
+        "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "resizable": false,
-        "visible": false,
-        "backgroundColor": "#1a1b26"
+        "visible": false
       },
       {
         "label": "settings",

@@ -34,8 +34,9 @@ const BG_PRESETS = ["night", "aurora", "violet", "ember"];
 const DRAG_COMMIT_PX = 10;
 /** 滚轮翻页累积阈值（delta 像素，200ms 静默后重新累积）：触摸板轻微滚动不翻页 */
 const WHEEL_FLIP_ACCUM = 50;
-/** 弹簧响应（秒，越小越利落）：非"时长"——沉降时间由参数涌现 */
-const SPRING_RESPONSE = 0.35;
+/** 弹簧响应（秒，越小越利落）：非"时长"——沉降时间由参数涌现。
+ *  0.28（原 0.35）：沉降提前约 0.1s，切到矮页后收矮更早启动；代价是翻页手感略硬 */
+const SPRING_RESPONSE = 0.28;
 /** 阻尼比：1.0 = 临界阻尼（默认不回弹）；0.8 = 甩动释放专用的轻微回弹 */
 const SPRING_DAMPING_DEFAULT = 1.0;
 const SPRING_DAMPING_FLICK = 0.8;
@@ -79,15 +80,15 @@ function pageDesiredHeight(pageBody: HTMLElement): number {
   return Math.ceil(pageBody.getBoundingClientRect().height + dotsH + footerH + PANEL_CHROME_PX) + 5;
 }
 
-/** 内容高度自适应：观测当前页的 .page-body，内容/页码变化时把目标窗口高（内容+圆点+底栏+chrome）
- *  推给后端；后端据此重算窗口尺寸并重定位（隐藏时记忆，show 时校准）。
- *  切页期高度冻结（issue #48 第二轮，B 招）：切页起步时已按「两页取大」瞬时预长
- *  （preGrowFor 读 pageHeightsRef 实测记忆），冻结期（freezeRef）内 measure 只记录实测高、
- *  不上报——滑动全程零 set_size；弹簧沉降 / jumpWithFade 淡入结束时冲刷一次终审
- *  （measure(true)）。收矮/补高走后端 250ms/240Hz 缓动（animate=true，领导实机对比
- *  瞬时版后拍板；瞬时 set_size 会作废旧动画序号，与下一翻预长不踩踏）。
- *  非冻结期（面板开着的日常数据到达）：长高瞬时、压矮立即发（不等沉降——静息态
- *  没有弹簧会来沉降，fresh 打开会停在配置高不收矮，be15f90 遗留的开口，本轮修）。 */
+/** 内容高度自适应：观测当前页的 .page-body，内容/页码变化时把目标视觉高（内容+圆点+底栏+chrome）
+ *  交给 applyHeight（前端 .panel CSS height 过渡 + 后端 region 动画；隐藏时后端只记忆，show 时校准）。
+ *  切页期（freezeRef）不再冻结高度等弹簧沉降：measure 一测到就 applyHeight(animate=true)
+ *  平滑跟上，与滑动弹簧同步（起步先按 pageHeightsRef 的实测记忆 preGrowFor 预调，首翻无记忆
+ *  则由页 effect 测到即调）；过渡期 html.panel-resizing 藏起页内滚动条，长高/收矮途中不闪滚动条。
+ *  沉降终审（measure(true)）仍兜底数据晚到/测量抖动。收矮/补高走 applyHeight(animate=true)：
+ *  CSS 300ms back-out 过渡 + 后端同曲线 region 动画（瞬时值会作废旧动画序号，与下一翻预调不踩踏）。
+ *  非冻结期（面板开着的日常数据到达）：长高瞬时（一步到位防溢出）、压矮立即发（不等沉降——
+ *  静息态没有弹簧会来沉降，fresh 打开会停在配置高不收矮，be15f90 遗留的开口）。 */
 function usePanelContentHeight(
   page: number,
   ready: boolean,
@@ -96,6 +97,8 @@ function usePanelContentHeight(
   pageHeightsRef: React.MutableRefObject<Map<number, number>>,
   rafRef: React.MutableRefObject<number | null>,
   settleGuardRef: React.MutableRefObject<(page: number) => boolean>,
+  applyHeight: (h: number, animate: boolean) => void,
+  currentHeightRef: React.MutableRefObject<number>,
 ) {
   useEffect(() => {
     if (!ready || !isTauri) return;
@@ -113,23 +116,32 @@ function usePanelContentHeight(
       const desired = pageDesiredHeight(pageBody);
       // 实测高记忆：B 招「两页取大」预长与 C 招闲时预热共用（每次测到都刷新，内容变高记忆跟随）
       pageHeightsRef.current.set(page, desired);
-      const cur = window.innerHeight;
+      const cur = currentHeightRef.current;
       if (freezeRef.current && !final) {
-        // 切页冻结期：滑动全程零 set_size，一律挂到沉降终审统一瞬时到位
+        // 切页期：不等弹簧沉降，测到就平滑跟上（滑动/过渡期滚动条已隐藏，溢出被裁不会闪滚动条）；
+        // 同时挂沉降终审兜底（数据晚到/测量抖动在沉降后再校正一次）
+        if (cur > 0 && Math.abs(desired - cur) > 2) {
+          applyHeight(desired, true);
+        }
         settleCbsRef.current = [() => measure(true)];
+        return;
+      }
+      if (cur <= 0) {
+        // 首次测量（窗口视口已固定、前端尚无视觉高度）：直接落到实测高
+        applyHeight(desired, false);
         return;
       }
       if (desired > cur + 0.5) {
         // 长高立即瞬时发（animate=false）：一步到位既防高页内容在旧矮窗口溢出，
         // 又不在滑动途中播后端高度缓动；同时作废挂起的压矮补发（防沉降后按旧值压矮）
         settleCbsRef.current = [];
-        setPanelContentHeight(desired, false);
+        applyHeight(desired, false);
       } else if (desired < cur - 2) {
         // 压矮分两态：过渡在播（弹簧在跑/冻结期，已由上面冻结分支拦下或在此判定）挂沉降终审——
         // 动画途中压矮会让正在滑出的高页瞬间溢出（滚动条一闪而过 + 内容被裁切）；
         // 静息态（rafRef 空且未冻结，如 fresh 打开/数据到达）没有高页在滑，立即发
         // （等沉降会永远不到：没翻页就没有弹簧，be15f90 遗留的开口）。
-        // 发送走 animate=true：后端 250ms/240Hz 缓动收矮（领导实机对比瞬时版后拍板）；
+        // 发送走 animate=true：后端 300ms back-out 缓动收矮（领导实机对比瞬时版后拍板）；
         // 后端瞬时 set_size 会作废旧动画序号，与下一翻预长不踩踏
         if (final || rafRef.current === null) {
           // 内容未齐守卫（收矮步进实验实机抓到的冷启动竞态，与 pacing 无关）：
@@ -140,7 +152,7 @@ function usePanelContentHeight(
             window.clearTimeout(recheckTimer);
             recheckTimer = window.setTimeout(() => measure(true), 400);
           } else {
-            setPanelContentHeight(desired, true);
+            applyHeight(desired, true);
           }
         } else {
           settleCbsRef.current = [() => measure(true)];
@@ -158,7 +170,7 @@ function usePanelContentHeight(
       window.clearTimeout(recheckTimer);
       ro.disconnect();
     };
-  }, [page, ready, settleCbsRef, freezeRef, pageHeightsRef, rafRef, settleGuardRef]);
+  }, [page, ready, settleCbsRef, freezeRef, pageHeightsRef, rafRef, settleGuardRef, applyHeight, currentHeightRef]);
 }
 
 /** 单账号页：页头账号名 + 该账号的卡片组（复用现有卡片，数据全部按账号取）。
@@ -646,6 +658,36 @@ function PanelApp() {
   };
 
   // 内容高度自适应：当前页内容驱动窗口高度（翻页/数据到达/极简切换都会重测）
+  /** 面板当前视觉高度（逻辑 px）：.panel 的 CSS 高度与后端 region 目标共同基准。
+   *  B 方案窗口视口固定，window.innerHeight 恒为最大高度，不能再当作「当前高度」。 */
+  const currentHeightRef = useRef(0);
+  /** 高度过渡期间的滚动条屏蔽定时器（见 applyHeight 的 panel-resizing） */
+  const heightAnimTimerRef = useRef(0);
+  /** 设置面板视觉高度：CSS 过渡（瞬时用 html.panel-instant 禁过渡）+ 通知后端 region 动画 */
+  const applyHeight = useCallback((h: number, animate: boolean) => {
+    currentHeightRef.current = h;
+    const root = document.documentElement;
+    window.clearTimeout(heightAnimTimerRef.current);
+    if (!animate) {
+      root.classList.add("panel-instant");
+      root.classList.remove("panel-resizing");
+    } else {
+      // 过渡期间藏起页内滚动条（html.panel-resizing）：容器高度尚未到位时内容短暂溢出，
+      // 不得闪出滚动条；340ms 略长于 300ms 过渡 + 过冲回落，收尾那一帧也不会露出
+      root.classList.add("panel-resizing");
+      heightAnimTimerRef.current = window.setTimeout(
+        () => root.classList.remove("panel-resizing"),
+        340,
+      );
+    }
+    root.style.setProperty("--panel-h", `${h}px`);
+    if (!animate) {
+      // 强制回流后再恢复过渡，避免下一次动画从本次瞬时值重播
+      void document.body.offsetHeight;
+      root.classList.remove("panel-instant");
+    }
+    setPanelContentHeight(h, animate);
+  }, []);
   usePanelContentHeight(
     page,
     state !== null && accounts.length > 0,
@@ -654,6 +696,8 @@ function PanelApp() {
     pageHeightsRef,
     rafRef,
     settleGuardRef,
+    applyHeight,
+    currentHeightRef,
   );
 
   /** 页宽 = 翻页视口宽（.page 宽 100% 与视口一致） */
@@ -665,18 +709,18 @@ function PanelApp() {
     if (trackRef.current) trackRef.current.style.transform = `translateX(${-x}px)`;
   }, []);
 
-  /** B 招「两页取大」预长（issue #48 第二轮）：切页起步、动画第一帧前，把窗口瞬时长到
-   *  max(当前高, 目标页实测记忆高)——这是整个滑动期唯一一次 set_size（之后冻结到沉降）。
-   *  只长不缩（收矮一律留到沉降终审）；目标页高度未知（首翻、预热未及）则不预长，
-   *  退化为旧行为：冻结期测得后由沉降终审一次瞬时到位。 */
+  /** 切页起步预调高度：目标页有实测记忆时立即平滑过渡到它（不等弹簧沉降）。
+   *  旧「两页取大瞬时预长」会在切页第一帧跳高；现在与滑动同步平滑（300ms CSS + 后端 region
+   *  动画），滑动/过渡期滚动条已隐藏、页内溢出被裁，不会闪滚动条。目标页高度未知（首翻、
+   *  预热未及）则不做事，由页 effect 测到后按同一平滑路径补上。 */
   const preGrowFor = useCallback((next: number) => {
     if (!isTauri) return;
     const known = pageHeightsRef.current.get(next) ?? 0;
-    const growTo = Math.max(window.innerHeight, known);
-    if (growTo > window.innerHeight + 0.5) {
-      setPanelContentHeight(growTo, false);
+    const cur = currentHeightRef.current;
+    if (known > 0 && Math.abs(known - cur) > 2) {
+      applyHeight(known, true);
     }
-  }, []);
+  }, [applyHeight]);
 
   /** 手写弹簧（§4，damping ratio + response 参数化，rAF 半隐式欧拉积分）：
    *  从当前实时位移与速度起步（§3 可中断、反向平滑）；不传初速度则沿用当前速度（换目标速度混合不硬切）。

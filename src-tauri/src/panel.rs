@@ -1,11 +1,19 @@
+#[cfg(windows)]
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use tauri::{
-    AppHandle, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
-};
+use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
 /// 面板边缘与托盘图标 / 屏幕边缘之间保留的间距（物理像素）。
 const EDGE_MARGIN: i32 = 8;
+
+/// 自绘外框（阴影）每边逻辑 px。窗口用 `SetWindowRgn` 裁剪成自定义形状后，DWM 不再为
+/// 窗口绘制阴影/系统边框——原先那圈"外框"会消失。这里让窗口在面板四周各留出这一圈：
+/// 窗口宽 +2×pad、region 高 +2×pad、`.panel` 在窗口内 bottom 留 pad，由前端
+/// `box-shadow` 把阴影画回来。region 外圆角取「面板 8 + pad」保证内外同心。
+/// ⚠️ 窗口必须是 `transparent: true` + `shadow: false`（tauri.conf.json）：不透明窗口会在
+/// 这一圈填 WebView2 底色（深色主题下就是实心黑边），DWM 系统阴影也会在 region 裁剪后消失。
+const FRAME_PAD: f64 = 8.0;
 
 /// 极简模式的面板紧凑逻辑高度（只显示页头 + 7天/5小时额度条 + 翻页圆点 + 底栏）。
 /// 内容自适应生效后的兜底：前端尚未实测时用它做极简模式的初始高。
@@ -14,13 +22,19 @@ const MINIMAL_PANEL_HEIGHT: f64 = 350.0;
 /// 内容自适应的最小窗口逻辑高：防极端内容（如只剩页头 + 底栏）把窗口压得失形。
 const MIN_PANEL_HEIGHT: f64 = 200.0;
 
-/// 内容驱动的高度缓动动画时长 / 帧间隔（开窗前的 fit 不动画，见 fit 的 animate 参数）。
-/// 帧间隔 4ms（60 次原子 SetWindowPos/250ms，与 240Hz 高分屏刷新率对齐；2026-09-08 领导实机对比
-/// 瞬时/30Hz/68Hz/100 次各档后拍板 60 次档——100 次档无可见增益且排版调用多 67%）：
-/// tokio sleep 在 Windows 被定时器精度（~15.6ms）限到 ~68Hz（实测 13 步/188ms），
-/// 故帧 pacing 用自旋等绝对时刻表——自旋总量 4ms×~60 次/动画、仅沉降/静息收矮触发
-const RESIZE_ANIM_MS: u64 = 250;
-const RESIZE_FRAME_MS: u64 = 4;
+/// 内容驱动的视觉高度缓动时长 / 帧间隔（开窗前的 fit 不动画，见 fit 的 animate 参数）。
+/// B 方案：窗口几何固定在「配置高（屏幕内取小）」，动画只改窗口 region（SetWindowRgn）
+/// 裁剪出视觉高度，WebView2 视口全程不变——wry 给子窗口的 ASYNC SetWindowPos 与 WebView2
+/// 内部布局滞后都不再影响底栏。帧间隔 16ms（约 19 帧/300ms，60Hz）：SetWindowRgn 从
+/// 动画线程调用会同步消息到 GUI 线程，8ms 帧（38 次/动画）把主线程压到饱和、WebView2
+/// 渲染饥饿（表现为卡顿/卡死）；300ms 动画本身够长，60Hz 的 19 帧已足够平滑。
+/// 300ms + 轻微过冲（back-out 2%，见 `ease_out_back`）：前段够快、过冲后留足回落时间，
+/// 不会像 200ms 那样"冲过再弹回"抖成抽搐。过冲幅度/时长改动必须同步前端 CSS transition。
+const RESIZE_ANIM_MS: u64 = 300;
+const RESIZE_FRAME_MS: u64 = 16;
+/// 当前视觉高度（逻辑像素 f64 位模式；0 = 未设置）：动画中断时作为下一段动画的起点，
+/// 避免从上一目标值跳变。
+static PANEL_VISUAL_H: AtomicU64 = AtomicU64::new(0);
 /// 高度动画序号（单调递增）：新动画顶掉进行中的旧动画（可中断，从实时高度起步）
 static RESIZE_ANIM_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 在播动画的目标逻辑高（f64 位模式；0 = 无在播动画），目标防抖用
@@ -29,9 +43,39 @@ static RESIZE_ANIM_TARGET: AtomicU64 = AtomicU64::new(0);
 /// （不顶序号、不重启动画），吸收内容测高的亚像素级抖动
 const RESIZE_TARGET_DEBOUNCE: f64 = 4.0;
 
-/// ease-out cubic 缓动：起步快、收尾稳
-fn ease_out_cubic(t: f64) -> f64 {
-    1.0 - (1.0 - t).powi(3)
+/// 带轻微过冲的缓出（back-out）：与前端 CSS `cubic-bezier(0.3, 1.3, 0.6, 1)` 严格同曲线，
+/// 峰值约 1.02（2% 过冲，出现在 ~68% 时间）——窗口高度先越过目标再回落，是"力量感"来源。
+/// 三处参数必须一致：CSS transition、这里、以及前端 `duration 200ms`；
+/// 任一处不同步都会让 region 裁剪与 CSS 高度错位（边框/阴影抖动、内容裁切）。
+fn ease_out_back(t: f64) -> f64 {
+    // back-out：P1=(0.3,1.25) P2=(0.6,1)；x(s) 单调，二分求 x(s)=t 再取 y(s)。
+    // 24 次迭代精度 ~1e-7，每帧一次纯数学开销可忽略。
+    let (x1, y1, x2, y2) = (0.3, 1.25, 0.6, 1.0);
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let bez = |a1: f64, a2: f64, s: f64| {
+        let u = 1.0 - s;
+        3.0 * u * u * s * a1 + 3.0 * u * s * s * a2 + s * s * s
+    };
+    let (mut lo, mut hi) = (0.0, 1.0);
+    let mut s = t;
+    for _ in 0..24 {
+        let x = bez(x1, x2, s);
+        if (x - t).abs() < 1e-9 {
+            break;
+        }
+        if x < t {
+            lo = s;
+        } else {
+            hi = s;
+        }
+        s = 0.5 * (lo + hi);
+    }
+    bez(y1, y2, s)
 }
 
 /// 托盘图标的物理像素区域（由 tray-icon 事件的 rect 转换而来）。
@@ -138,28 +182,105 @@ fn lock_panel_win() -> MutexGuard<'static, ()> {
     PANEL_WIN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 窗口外框与客户区在宽/高上的差值（物理像素）。
-/// Windows 无边框 + 阴影窗口带隐藏偏移（tao `undecorated_with_shadows`），因此
-/// `set_size`（inner 语义）与 `set_position`（outer 语义）不能混用同一套尺寸：
-/// 锚定与 SetWindowPos 的 cx/cy 一律用外框尺寸，inner 目标值只在算外框时加回差值。
-fn outer_frame_extra(window: &WebviewWindow) -> (i32, i32) {
-    let (Ok(inner), Ok(outer)) = (window.inner_size(), window.outer_size()) else {
-        return (0, 0);
+/// 面板窗口 HWND 缓存：`WebviewWindow::hwnd()` 本身是同步消息 getter（channel 往返），
+/// 动画每帧调用会被主线程拖住；主窗口不重建，首次读到后进程内复用。
+#[cfg(windows)]
+static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
+
+#[cfg(windows)]
+fn panel_hwnd(window: &WebviewWindow) -> Option<*mut std::ffi::c_void> {
+    let cached = PANEL_HWND.load(Ordering::Acquire);
+    if cached != 0 {
+        return Some(cached as *mut std::ffi::c_void);
+    }
+    let hwnd = window.hwnd().ok()?;
+    let raw = hwnd.0 as isize;
+    PANEL_HWND.store(raw, Ordering::Release);
+    Some(raw as *mut std::ffi::c_void)
+}
+
+/// 窗口当前是否可见：Windows 直接走 Win32 `IsWindowVisible`（无消息往返）。
+/// **不能**用 `WebviewWindow::is_visible().unwrap_or(false)`：那条是同步消息，主线程忙
+/// （React 渲染/IPC）时可能返回 Err，unwrap_or(false) 会把「可见」误判成隐藏——
+/// refit 直接跳过（面板高度卡死不再更新）、高度动画中途退出（region 停在半截）。
+#[cfg(windows)]
+fn window_visible(window: &WebviewWindow) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    panel_hwnd(window).is_some_and(|h| unsafe { IsWindowVisible(h) } != 0)
+}
+
+#[cfg(not(windows))]
+fn window_visible(window: &WebviewWindow) -> bool {
+    window.is_visible().unwrap_or(false)
+}
+
+/// 移除窗口 region（恢复完整矩形）：fit 失败（取不到显示器/配置）时的兜底——
+/// 旧 region 可能来自上一页/上一次几何，尺寸不匹配会把面板顶部裁掉。
+/// 完整矩形窗口的透明区不绘制、只接收点击，视觉上完整（代价是点击区域暂时变大）。
+#[cfg(windows)]
+fn clear_window_region(window: &WebviewWindow) {
+    use windows_sys::Win32::Graphics::Gdi::SetWindowRgn;
+    if let Some(hwnd) = panel_hwnd(window) {
+        // SAFETY: hwnd 为本进程活动窗口句柄；region=NULL 表示移除裁剪区域。
+        unsafe {
+            SetWindowRgn(hwnd, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn clear_window_region(_window: &WebviewWindow) {}
+
+/// 窗口客户区与外框物理尺寸：Windows 直接走 Win32（GetClientRect / GetWindowRect），
+/// 不走 Tauri 的同步消息 getter——切页时主线程正忙 React + WebView2 重排，每读一次
+/// 尺寸都要等主线程处理，是「预长 / 收矮响应慢」的主要来源。
+/// 非 Windows 回退 Tauri getter（平台无关兜底）。
+#[cfg(windows)]
+fn window_sizes(window: &WebviewWindow) -> Option<(PhysicalSize<u32>, PhysicalSize<u32>)> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+    let hwnd = panel_hwnd(window)?;
+    let mut client = RECT::default();
+    let mut outer = RECT::default();
+    // SAFETY: hwnd 为本进程活动窗口句柄；两个 API 只写调用方提供的 RECT。
+    unsafe {
+        if GetClientRect(hwnd, &mut client) == 0 || GetWindowRect(hwnd, &mut outer) == 0 {
+            return None;
+        }
+    }
+    let size = |r: RECT| {
+        PhysicalSize::new(
+            (r.right - r.left).max(0) as u32,
+            (r.bottom - r.top).max(0) as u32,
+        )
     };
+    Some((size(client), size(outer)))
+}
+
+#[cfg(not(windows))]
+fn window_sizes(window: &WebviewWindow) -> Option<(PhysicalSize<u32>, PhysicalSize<u32>)> {
+    Some((window.inner_size().ok()?, window.outer_size().ok()?))
+}
+
+/// 窗口外框与客户区在宽/高上的差值（物理像素）：Windows 无边框 + 阴影窗口带隐藏偏移
+/// （tao `undecorated_with_shadows`）。`set_size` 是 inner 语义、`set_position` 是 outer
+/// 语义，二者不能混用同一套尺寸——锚定与 SetWindowPos 的 cx/cy 一律用外框尺寸，
+/// inner 目标值只在算外框时加回差值（由 `fit_panel_to_screen` 读一次后传入各路径）。
+fn frame_extra(inner: PhysicalSize<u32>, outer: PhysicalSize<u32>) -> (i32, i32) {
     (
         outer.width.saturating_sub(inner.width) as i32,
         outer.height.saturating_sub(inner.height) as i32,
     )
 }
 
-/// 面板窗口尺寸 + 位置统一出口（物理像素）：
+/// 面板窗口几何（尺寸 + 位置）统一出口（物理像素），只在 show/fit/显示器变化时调用：
 /// - Windows 走单条 `SetWindowPos(hwnd, x, y, outer_w, outer_h)`，位置与尺寸原子生效，
 ///   消除「先 set_size（顶边锚定向下长出）再 set_position（上移做底边锚定）」两条异步
-///   消息之间的错位中间态（切到高页时底边会短暂冲过托盘图标，跨 vblank 即渲染成跳动）；
+///   消息之间的错位中间态；
 /// - 拿不到 HWND / 非 Windows 回退 Tauri 两步 API（语义等价，仅多一条消息）。
 ///
-/// `inner_w/inner_h` 是客户区目标尺寸，`extra` 是实测外框差（见 `outer_frame_extra`）；
-/// 调用方必须先持 `PANEL_WIN_LOCK`（锁内成对完成「查序号/顶号 + 设置」）。
+/// B 方案下 `inner_w/inner_h` 恒为「配置宽 + 配置高」（固定几何），内容高只由 region 裁剪。
+/// 调用方必须先持 `PANEL_WIN_LOCK`（与 region 设置串行，旧帧不会覆盖新结果）。
 fn apply_inner_size_pos(
     window: &WebviewWindow,
     x: i32,
@@ -180,25 +301,39 @@ fn apply_inner_size_pos(
 }
 
 /// Windows：单条 SetWindowPos 同时给定位置与外框尺寸（物理像素），成功返回 true。
+/// **同步**（不用 SWP_ASYNCWINDOWPOS）：fit 紧接着要按客户区算 region，异步投递会让
+/// `GetClientRect` 读到旧尺寸——窗口从矮变高时 region 被旧高 clamp，面板顶部被裁。
+/// 几何未变化时短路返回（切页热路径零系统调用）。
 #[cfg(windows)]
 fn set_window_size_pos_once(window: &WebviewWindow, x: i32, y: i32, w_px: i32, h_px: i32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER,
+        GetWindowRect, SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER,
     };
-    let Ok(hwnd) = window.hwnd() else {
+    use windows_sys::Win32::Foundation::RECT;
+    let Some(hwnd) = panel_hwnd(window) else {
         return false;
     };
-    // SAFETY: hwnd 为本进程活动窗口句柄；SWP_NOZORDER 不动 Z 序（alwaysOnTop 由窗口
-    // 样式保持，不受影响）、SWP_NOACTIVATE 不抢焦点；x/y/cx/cy 均为调用方钳进屏幕
-    // 范围的物理像素值。
+    let (w_px, h_px) = (w_px.max(1), h_px.max(1));
+    let mut cur = RECT::default();
+    // SAFETY: hwnd 为本进程活动窗口句柄；GetWindowRect 只写调用方结构体。
+    let same = unsafe { GetWindowRect(hwnd, &mut cur) } != 0
+        && cur.left == x
+        && cur.top == y
+        && cur.right - cur.left == w_px
+        && cur.bottom - cur.top == h_px;
+    if same {
+        return true;
+    }
+    // SAFETY: 同上；SWP_NOZORDER 不动 Z 序、SWP_NOACTIVATE 不抢焦点；x/y/cx/cy 均为
+    // 调用方钳进屏幕范围的物理像素值。
     unsafe {
         SetWindowPos(
-            hwnd.0,
+            hwnd,
             HWND_TOP,
             x,
             y,
-            w_px.max(1),
-            h_px.max(1),
+            w_px,
+            h_px,
             SWP_NOZORDER | SWP_NOACTIVATE,
         ) != 0
     }
@@ -209,7 +344,7 @@ pub fn toggle_panel(app: &AppHandle, tray: TrayRect) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    if window.is_visible().unwrap_or(false) {
+    if window_visible(&window) {
         let _ = window.hide();
     } else {
         show_panel(app, tray);
@@ -221,9 +356,13 @@ pub fn show_panel(app: &AppHandle, tray: TrayRect) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    // 开窗前校准必须瞬时（面板一出现就是对的尺寸，不播动画）
-    fit_panel_to_screen(app, &window, tray, false);
-    position_panel(app, &window, tray);
+    // 开窗前校准必须瞬时（面板一出现就是对的尺寸，不播动画）；
+    // fit 返回 true 时尺寸 + 位置已原子完成，不再重复定位（少一次 getter 往返）
+    if !fit_panel_to_screen(app, &window, tray, false) {
+        position_panel(app, &window, tray);
+        // fit 失败时 region 可能是旧的（尺寸不匹配会裁掉面板顶部）：直接移除裁剪兜底
+        clear_window_region(&window);
+    }
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -244,110 +383,211 @@ fn effective_panel_height(config_height: f64, monitor_height_px: u32, monitor_sc
     config_height.min(cap).max(1.0)
 }
 
-/// 每次显示面板前校准窗口尺寸：宽恒取配置值，高优先取前端实测内容高（AppState 里的
-/// 面板内容高度，自适应主路径），未实测过时回退到基准高（极简紧凑高/配置高），
-/// 并在显示器可用高度内取小（小屏压高）。
+/// 视觉高度（逻辑像素）→ 窗口 region：面板底边贴托盘，区域保留窗口底部 h，顶部裁掉。
+/// `region_h_logical` 是裁剪高度、`visual_h_logical` 是面板真实视觉高（存给下一段动画
+/// 起步用）——两者分开是为了「取大」策略：动画帧传 `max(当前高, 目标高)`，region 恒
+/// ≥ 面板高，CSS 过渡与 region 动画即使短暂不同步也绝不会把面板顶部裁掉（裁切=截断）；
+/// 变矮时 region 先保持大、到终点再收，视觉上只是上方透明区大小变化。
+/// 关键：SetWindowRgn 用**窗口坐标**（含无边框阴影窗口的非客户区偏移），必须先把客户区
+/// 左上换算到窗口坐标，否则 region 整体左/上偏一个阴影宽度——内容被裁一侧、另一侧露出
+/// 窗口背景（浅色主题下就是“白边”）。区域用圆角矩形（Win11 窗口圆角约 8 逻辑 px），
+/// 避免矩形 region 把 DWM 圆角盖成直角。
+/// 成功后系统接管 region 句柄（替换时旧 region 由系统释放），失败时手动删除。
+#[cfg(windows)]
+fn set_window_region(
+    window: &WebviewWindow,
+    region_h_logical: f64,
+    visual_h_logical: f64,
+    scale: f64,
+) -> bool {
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        ClientToScreen, CreateRoundRectRgn, DeleteObject, SetWindowRgn,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+    let Some(hwnd) = panel_hwnd(window) else {
+        return false;
+    };
+    let mut client = RECT::default();
+    let mut outer = RECT::default();
+    let mut origin = POINT { x: 0, y: 0 };
+    // SAFETY: hwnd 为本进程活动窗口句柄；三个 API 只写调用方提供的结构体。
+    unsafe {
+        if GetClientRect(hwnd, &mut client) == 0 || GetWindowRect(hwnd, &mut outer) == 0 {
+            return false;
+        }
+        if ClientToScreen(hwnd, &mut origin) == 0 {
+            return false;
+        }
+    }
+    let cw = (client.right - client.left).max(1);
+    let ch = (client.bottom - client.top).max(1);
+    let ox = origin.x - outer.left;
+    let oy = origin.y - outer.top;
+    // 视觉高含上下两圈自绘外框：面板底边距窗口底 pad，顶部再留 pad 给阴影
+    let h_px = (((region_h_logical + 2.0 * FRAME_PAD) * scale).round() as i32).clamp(1, ch);
+    // CreateRoundRectRgn 的椭圆参数是直径（半径 ×2）。外圆角 = 面板圆角 8 + pad：
+    // 与外层 `.panel` 的 8px border-radius 同心，裁剪边缘不会露出直角。
+    let radius = ((8.0 + FRAME_PAD) * scale).round().max(1.0) as i32;
+    // SAFETY: 新 region 坐标均为非负；SetWindowRgn 成功后窗口系统接管该 region，
+    // 调用方不再删除（后续 region 替换时旧 region 由系统释放）。
+    let rgn =
+        unsafe { CreateRoundRectRgn(ox, oy + ch - h_px, ox + cw, oy + ch, 2 * radius, 2 * radius) };
+    if rgn.is_null() {
+        return false;
+    }
+    if unsafe { SetWindowRgn(hwnd, rgn, 1) } == 0 {
+        // SAFETY: SetWindowRgn 失败时 region 未被系统接管，需调用方释放。
+        unsafe { DeleteObject(rgn) };
+        return false;
+    }
+    PANEL_VISUAL_H.store(visual_h_logical.to_bits(), Ordering::SeqCst);
+    true
+}
+
+#[cfg(not(windows))]
+fn set_window_region(
+    _window: &WebviewWindow,
+    _region_h_logical: f64,
+    visual_h_logical: f64,
+    _scale: f64,
+) -> bool {
+    PANEL_VISUAL_H.store(visual_h_logical.to_bits(), Ordering::SeqCst);
+    false
+}
+
+/// 当前视觉高度（逻辑 px）：从未设置过返回 None（动画从这里起步）。
+fn visual_height_logical() -> Option<f64> {
+    let bits = PANEL_VISUAL_H.load(Ordering::SeqCst);
+    if bits == 0 {
+        None
+    } else {
+        Some(f64::from_bits(bits))
+    }
+}
+
+/// 每次显示/内容高度变化时校准面板：窗口几何固定为「配置高（显示器可用高内取小）」+
+/// 底边锚定，内容高只决定 region 裁剪出的视觉高度（瞬时或 300ms 动画）——WebView2 视口
+/// 全程不变，前端 CSS height 过渡同步收缩内容/底栏。
 /// 全程只用逻辑像素 + 托盘所在显示器的缩放比：此时窗口可能还停在别的显示器上，
-/// `window.scale_factor()` 是错的；也不把量到的窗口尺寸直接喂回 set_size（set_size 是
-/// inner 语义、回读值语义混用会累加偏差把窗口越撑越宽，面板两侧露白边）——尺寸仍从
-/// conf/内容高推导，回读值只用于算外框与客户区的固定差（见 `outer_frame_extra`）。
-fn fit_panel_to_screen(app: &AppHandle, window: &WebviewWindow, tray: TrayRect, animate: bool) {
+/// `window.scale_factor()` 是错的；回读尺寸只用于算外框与客户区的固定差。
+///
+/// 返回值：true = 几何/region 已设置（瞬时路径）或已启动 region 动画；false = 取不到
+/// 配置或显示器，调用方需 `position_panel` 仅定位兜底。
+fn fit_panel_to_screen(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    tray: TrayRect,
+    animate: bool,
+) -> bool {
     let Some(conf) = app.config().app.windows.iter().find(|w| w.label == "main") else {
-        return;
+        return false;
     };
     let Ok(Some(monitor)) = app.monitor_from_point(tray.x as f64, tray.y as f64) else {
-        return; // 取不到显示器：保持配置尺寸，不压高
+        tracing::warn!(
+            "panel fit: monitor_from_point failed for tray ({}, {})",
+            tray.x,
+            tray.y
+        );
+        return false; // 取不到显示器：保持配置尺寸，不压高
     };
     let scale = monitor.scale_factor();
-    // 极简模式读当前设置（读失败按普通模式兜底，不压矮）
-    let minimal_mode = kimicodebar::storage::load_settings()
-        .map(|s| s.minimal_mode)
-        .unwrap_or(false);
-    // 内容自适应：前端实测内容高优先（含最小高保护），未实测回退基准高
+    // 内容自适应：前端实测内容高优先（含最小高保护），未实测才回退基准高——
+    // 基准高需要极简模式开关，读设置是磁盘 + JSON 解析，切页热路径（有实测高）
+    // 绝不能碰，否则每次预长/收矮都多几毫秒 IO 延迟
     let base = app
         .state::<crate::commands::AppState>()
         .panel_content_height()
         .map(|h| h.max(MIN_PANEL_HEIGHT))
-        .unwrap_or_else(|| base_panel_height(conf.height, minimal_mode));
+        .unwrap_or_else(|| {
+            let minimal_mode = kimicodebar::storage::load_settings()
+                .map(|s| s.minimal_mode)
+                .unwrap_or(false);
+            base_panel_height(conf.height, minimal_mode)
+        });
     let target_h = effective_panel_height(base, monitor.size().height, scale);
-    // 已接近目标尺寸就不动（当前尺寸按窗口自己所在显示器的缩放比换算）
-    let cur_scale = window.scale_factor().unwrap_or(scale);
-    if let Ok(inner) = window.inner_size() {
-        let cur_w = inner.width as f64 / cur_scale;
-        let cur_h = inner.height as f64 / cur_scale;
-        if (cur_w - conf.width).abs() < 2.0 && (cur_h - target_h).abs() < 2.0 {
-            return;
+    // 客户区 + 外框尺寸一次读完（Win32 直读，零消息往返）：只用于算外框差（阴影偏移）。
+    let sizes = window_sizes(window);
+    let extra = match sizes {
+        Some((inner, outer)) => frame_extra(inner, outer),
+        None => (0, 0),
+    };
+    let mon = monitor_geom(&monitor);
+    // B 方案固定窗口几何：窗口高度取「配置高（屏幕可用高内取小）」，再受托盘锚定方向上的
+    // 可用空间限制——矮屏 / 任务栏在顶部时，否则窗口底会被 clamp 出屏、region 底部盖住托盘。
+    // 内容高只决定 region 视觉高度；窗口/视口全程不变。
+    // 自绘外框：窗口比面板上下各多 FRAME_PAD（窗口尺寸下面统一 +2×pad），fixed_h 先扣掉。
+    let mut fixed_h = (effective_panel_height(conf.height, monitor.size().height, scale)
+        - 2.0 * FRAME_PAD)
+        .max(MIN_PANEL_HEIGHT);
+    let top_room = (tray.y - 2 * EDGE_MARGIN - mon.y - extra.1) as f64 / scale - 2.0 * FRAME_PAD;
+    let bottom_room = (mon.y + mon.h - (tray.y + tray.height) - 2 * EDGE_MARGIN - extra.1) as f64
+        / scale
+        - 2.0 * FRAME_PAD;
+    let flips =
+        tray.y - frame_height_px(fixed_h + 2.0 * FRAME_PAD, scale) as i32 - extra.1 - EDGE_MARGIN
+            < mon.y + EDGE_MARGIN;
+    fixed_h = fixed_h
+        .min(if flips { bottom_room } else { top_room })
+        .max(MIN_PANEL_HEIGHT);
+    // 内容实测高不得超过窗口可承载的面板高（fixed_h 已扣掉上下外框）：超长内容由页内滚动消化
+    let target_h = target_h.min(fixed_h);
+    tracing::info!(
+        "panel fit: base={base:.1} target={target_h:.1} fixed={fixed_h:.1} flips={flips} scale={scale:.2} mon=({},{},{}x{}) tray=({},{},{}x{})",
+        mon.x,
+        mon.y,
+        mon.w,
+        mon.h,
+        tray.x,
+        tray.y,
+        tray.width,
+        tray.height
+    );
+    let w_px = frame_height_px(conf.width + 2.0 * FRAME_PAD, scale) as i32;
+    let fixed_h_px = frame_height_px(fixed_h + 2.0 * FRAME_PAD, scale) as i32;
+    // 窗口几何（固定高 + 底边锚定，瞬时、幂等）：尺寸与内容无关，切页时重复设置同尺寸
+    // 不会触发 WebView2 resize。
+    let (x, y) = anchored_panel_pos(tray, Some(mon), w_px + extra.0, fixed_h_px + extra.1);
+    // 自绘外框：窗口底边贴托盘图标顶（原先 EDGE_MARGIN 的间距改由 `.panel` 的 bottom pad
+    // 承担），这样面板底边到托盘仍是 EDGE_MARGIN，底部 pad 区留给阴影。翻转时面板贴窗口顶，
+    // 不再下移（保持原行为，翻转场景的 region 方向不在本次改动范围）。
+    let y = if flips {
+        y
+    } else {
+        y + frame_height_px(FRAME_PAD, scale) as i32
+    };
+    {
+        let _guard = lock_panel_win();
+        if !animate {
+            RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst);
+            RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
+        }
+        apply_inner_size_pos(window, x, y, w_px, fixed_h_px, extra);
+        if !animate {
+            // 瞬时路径：顶号与 region 设置在同一临界区，旧动画帧不可能覆盖。
+            set_window_region(window, target_h, target_h, scale);
         }
     }
-    // animate=false（开窗前校准 / 切页期高度冻结的瞬时到位）一次性到位；
-    // animate=true（开窗后内容驱动）走缓动动画
-    if !animate {
-        // 瞬时到位必须先作废在播的高度动画：否则在播缓动的后续帧会把瞬时结果覆盖回去
-        // （issue #48 第二轮实机取证抓到：上一翻沉降触发的收矮缓动尾帧把下一翻的
-        // 瞬时长高拖回矮值，高页被裁着滑完、沉降后再弹回——窗口高度乱抖的卡顿本体）。
-        // 顶号与设置在同一临界区：原子 SetWindowPos 绕过消息队列 FIFO，旧帧晚到会覆盖
-        // 正确结果；锁内先顶号，旧帧下一帧复查序号必退出。
-        // 尺寸 + 位置走单条 SetWindowPos 原子生效，锚定用外框尺寸（set_position 是
-        // outer 坐标），与动画帧同一基准，消除「长高走瞬时、收矮走动画」各跳一个边框差。
-        let w_px = frame_height_px(conf.width, scale) as i32;
-        let h_px = frame_height_px(target_h, scale) as i32;
-        let extra = outer_frame_extra(window);
-        let (x, y) = anchored_panel_pos(
-            tray,
-            Some(monitor_geom(&monitor)),
-            w_px + extra.0,
-            h_px + extra.1,
-        );
-        let _guard = lock_panel_win();
-        RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst);
-        RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
-        apply_inner_size_pos(window, x, y, w_px, h_px, extra);
-        return;
+    if animate {
+        animate_region_to(window, target_h, scale);
     }
-    animate_height_to(app, window, tray, conf.width, target_h);
+    true
 }
 
-/// 把窗口高度从当前实时值缓动到目标值（ease-out cubic 250ms @ 30Hz，底边锚定每帧重定位）。
-/// 新的调用顶掉进行中的动画（序号失效即退出，下一次从实时高度重新起步，可中断）；
+/// 把窗口 region 的视觉高度从当前值缓动到目标值（back-out 300ms @ 60Hz，2% 轻微过冲）。
+/// 只改窗口形状（SetWindowRgn），不移动/缩放窗口：WebView2 视口固定，前端 CSS height
+/// 过渡同步驱动内容与底栏，底部 dots/footer 不再受 WebView2 resize 滞后影响。
+/// 新的调用顶掉进行中的动画（序号失效即退出，下一次从 PANEL_VISUAL_H 重新起步，可中断）；
 /// 与在播目标差 < 4 逻辑 px 的新目标被防抖忽略（不顶号、不重启，吸收测高抖动）；
 /// 面板中途被隐藏则让出（下次 show 时 fit 会一次性校准）。
-/// 消卡顿：托盘 rect / 显示器几何与缩放比 / 起点高 / 外框差值在启动时快照一次，循环体内
-/// 零系统查询——每帧只剩纯数学（缓动 + 物理取整 + 锚定翻转/clamp）+ 一次原子
-/// SetWindowPos（尺寸与位置同条消息，无「先 resize 再 move」的错位中间态）；
-/// 物理像素取整消除亚像素颤动。
-fn animate_height_to(
-    app: &AppHandle,
-    window: &WebviewWindow,
-    tray: TrayRect,
-    width: f64,
-    target_h: f64,
-) {
-    // 启动时快照：托盘所在显示器的几何与缩放比（fit 已保证取得到；取不到则瞬时到位兜底）
-    let Ok(Some(monitor)) = app.monitor_from_point(tray.x as f64, tray.y as f64) else {
-        // 无显示器信息无法定位，只能设尺寸；同样要顶号，防旧帧把这次结果覆盖回去
-        let _guard = lock_panel_win();
-        RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst);
-        RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
-        let _ = window.set_size(Size::Logical(LogicalSize::new(width, target_h)));
-        return;
-    };
-    let scale = monitor.scale_factor();
-    let mon = monitor_geom(&monitor);
-    // 起点高快照（读值仅此一次，不喂回）
-    let start_h = window
-        .inner_size()
-        .map(|s| s.height as f64 / scale)
-        .unwrap_or(target_h);
-    // 起点即目标：不动画，宽度顺带兜底校准（原子设置 + 顶号，与瞬时路径同语义）
+fn animate_region_to(window: &WebviewWindow, target_h: f64, scale: f64) {
+    let start_h = visual_height_logical().unwrap_or(target_h);
+    // 起点即目标：不动画，直接设 region（顶号，与瞬时路径同语义）
     if (start_h - target_h).abs() < 2.0 {
-        let w_px = frame_height_px(width, scale) as i32;
-        let h_px = frame_height_px(target_h, scale) as i32;
-        let extra = outer_frame_extra(window);
-        let (x, y) = anchored_panel_pos(tray, Some(mon), w_px + extra.0, h_px + extra.1);
         let _guard = lock_panel_win();
         RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst);
         RESIZE_ANIM_TARGET.store(0, Ordering::SeqCst);
-        apply_inner_size_pos(window, x, y, w_px, h_px, extra);
+        set_window_region(window, target_h, target_h, scale);
         return;
     }
     // 目标防抖：动画进行中收到与在播目标差 < 4 逻辑 px 的新目标 → 忽略（不顶序号、不重播）
@@ -357,43 +597,40 @@ fn animate_height_to(
     let seq = RESIZE_ANIM_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     RESIZE_ANIM_TARGET.store(target_h.to_bits(), Ordering::SeqCst);
     let win = window.clone();
-    // 宽度恒定（conf 逻辑宽不变）：物理宽启动时算一次，帧内复用；
-    // 外框差值同样快照（阴影边框不随窗口尺寸变），避免帧内读窗口尺寸
-    let win_w = frame_height_px(width, scale) as i32;
-    let extra = outer_frame_extra(window);
     tauri::async_runtime::spawn(async move {
         let start = std::time::Instant::now();
         let frame = std::time::Duration::from_millis(RESIZE_FRAME_MS);
         let mut next_frame = start + frame; // 绝对时刻表（防逐帧漂移）
+        let mut frame_idx: u32 = 0;
         loop {
-            if RESIZE_ANIM_SEQ.load(Ordering::SeqCst) != seq || !win.is_visible().unwrap_or(false) {
+            // 序号检查每帧（原子读，零成本）；可见性查询是主线程往返，每 8 帧
+            //（≈128ms）查一次——隐藏检测延迟无观感影响，却把整段动画的同步 getter
+            // 往返降到 2~3 次。
+            if RESIZE_ANIM_SEQ.load(Ordering::SeqCst) != seq
+                || (frame_idx % 8 == 0 && !window_visible(&win))
+            {
                 clear_anim_target_if_mine(target_h);
                 return;
             }
+            frame_idx += 1;
             let t = (start.elapsed().as_millis() as f64 / RESIZE_ANIM_MS as f64).min(1.0);
-            let h = start_h + (target_h - start_h) * ease_out_cubic(t);
-            let h_px = frame_height_px(h, scale);
-            // 底边锚定纯算术：翻转/clamp 用缓存常量每帧重判（翻转可能随高度变化中途触发）；
-            // 尺寸一律用外框（inner + extra），与 set_position 的 outer 坐标语义对齐
-            let (x, y) =
-                anchored_panel_pos(tray, Some(mon), win_w + extra.0, h_px as i32 + extra.1);
-            // 发帧前再核一次序号（锁内成对）：原子 SetWindowPos 绕过消息队列 FIFO，
-            // 顶部检查到设置之间若被瞬时到位（animate=false 会顶号）抢跑，这一帧就是
-            // 覆盖正确结果的「陈帧」（实机抓到：收矮动画最后一帧把预长结果拖回矮值）
+            let h = start_h + (target_h - start_h) * ease_out_back(t);
+            // 发帧前再核一次序号（锁内成对）：region 设置与顶号串行，旧帧不会覆盖新结果
             let guard = lock_panel_win();
             if RESIZE_ANIM_SEQ.load(Ordering::SeqCst) != seq {
                 drop(guard);
                 clear_anim_target_if_mine(target_h);
                 return;
             }
-            apply_inner_size_pos(&win, x, y, win_w, h_px as i32, extra);
+            // region 取大：恒包住面板（变高立即到位、变矮保持到终点），
+            // 与 CSS 过渡短暂不同步也不会裁掉面板顶部
+            set_window_region(&win, h.max(target_h), h, scale);
             drop(guard);
             if t >= 1.0 {
                 clear_anim_target_if_mine(target_h);
                 break;
             }
-            // 自旋等下一帧时刻（绝对时刻表防漂移）：tokio sleep 被 Windows 定时器精度
-            // （~15.6ms）限到 ~68Hz 拉不满 240Hz；自旋总量 4ms×~60 次/动画，开销可忽略
+            // 自旋等下一帧时刻（绝对时刻表防漂移）：16ms×~15 次/动画，开销可忽略
             while std::time::Instant::now() < next_frame {
                 std::hint::spin_loop();
             }
@@ -402,27 +639,30 @@ fn animate_height_to(
     });
 }
 
-/// 设置变更/内容高度变化后即时重算面板尺寸并重定位（仅面板可见时）。
-/// animate=true 时高度变化走 250ms 缓动动画（内容驱动的翻页收放），false 瞬时到位。
-/// 尺寸与定位走与 show_panel 完全相同的链路：conf 逻辑像素 + 托盘所在显示器缩放比。
+/// 设置变更/内容高度变化后即时重算面板视觉高度（仅面板可见时）。
+/// animate=true 时 region 高度走 300ms back-out 缓动（前端 CSS height 同步过渡），false 瞬时到位。
+/// 窗口几何固定，只有 region 在变；定位/显示器缩放与 show_panel 同一链路。
 pub fn refit_open_panel(app: &AppHandle, animate: bool) {
     let Some(window) = app.get_webview_window("main") else {
+        tracing::warn!("panel refit: main window missing");
         return;
     };
-    if !window.is_visible().unwrap_or(false) {
-        return;
+    if !window_visible(&window) {
+        return; // 隐藏时不重排（下次 show 会按记忆高校准）
     }
     let Some(tray) = app
         .tray_by_id(crate::tray::TRAY_ID)
         .and_then(|tray| tray.rect().ok().flatten())
         .map(|rect| TrayRect::new(rect.position, rect.size))
     else {
+        tracing::warn!("panel refit: tray rect unavailable, skip");
         return; // 取不到托盘位置：不动，下次打开面板时自然会校准
     };
-    fit_panel_to_screen(app, &window, tray, animate);
-    // 瞬时路径已在 fit 内原子完成「尺寸 + 位置」；这里再定位一次是幂等兜底
-    // （尺寸未变 / 动画在播时 position_panel 会自行让路，不会与首帧交叉）
-    position_panel(app, &window, tray);
+    // fit 返回 true：瞬时路径已完成「尺寸 + 位置」、或动画已启动（首帧即原子定位）；
+    // 仅尺寸已接近目标 / 取不到配置或显示器时才走 position_panel 兜底（幂等）
+    if !fit_panel_to_screen(app, &window, tray, animate) {
+        position_panel(app, &window, tray);
+    }
 }
 
 /// 第二个实例启动时显示主面板：优先按托盘图标当前位置定位，
@@ -436,6 +676,8 @@ pub fn show_panel_for_second_instance(app: &AppHandle) {
         Some(tray) => show_panel(app, tray),
         None => {
             if let Some(window) = app.get_webview_window("main") {
+                // 托盘 rect 取不到：无法定位/校准尺寸，至少移除旧 region（防截断）
+                clear_window_region(&window);
                 let _ = window.show();
                 let _ = window.set_focus();
             }
@@ -449,10 +691,10 @@ pub fn show_panel_for_second_instance(app: &AppHandle) {
 fn position_panel(app: &AppHandle, window: &WebviewWindow, tray: TrayRect) {
     // 读不到外框尺寸就不动：绝不能按 0×0 锚定（那会把窗口顶边锚到托盘上方 8px、
     // 主体盖住托盘图标，比保持原位更糟）；下次 show/refit 会重新校准。
-    let Ok(size) = window.outer_size() else {
+    let Some((_, outer)) = window_sizes(window) else {
         return;
     };
-    let (win_w, win_h) = (size.width as i32, size.height as i32);
+    let (win_w, win_h) = (outer.width as i32, outer.height as i32);
     let mon = app
         .monitor_from_point(tray.x as f64, tray.y as f64)
         .ok()
@@ -538,19 +780,28 @@ mod tests {
         );
     }
 
-    /// ease-out cubic：端点精确（0→0、1→1），区间内单调递增且始终快于线性（缓出特征）
+    /// back-out：端点精确（0→0、1→1），峰值约 1.02（2% 轻微过冲）后回落；
+    /// 前段足够陡（力量感），过冲幅度必须克制（>3% 会让内容裁切明显/显抽搐）
     #[test]
-    fn ease_out_cubic_endpoints_and_shape() {
-        assert_eq!(ease_out_cubic(0.0), 0.0);
-        assert_eq!(ease_out_cubic(1.0), 1.0);
-        let mut prev = 0.0;
-        for i in 1..=10 {
-            let t = i as f64 / 10.0;
-            let v = ease_out_cubic(t);
-            assert!(v > prev, "应单调递增: {prev} -> {v}");
-            assert!(v >= t, "缓出曲线应不落后于线性: {v} >= {t}");
-            prev = v;
+    fn ease_out_back_endpoints_and_overshoot() {
+        assert_eq!(ease_out_back(0.0), 0.0);
+        assert_eq!(ease_out_back(1.0), 1.0);
+        let mut peak = 0.0_f64;
+        let mut peak_t = 0.0;
+        for i in 1..100 {
+            let t = i as f64 / 100.0;
+            let v = ease_out_back(t);
+            if v > peak {
+                peak = v;
+                peak_t = t;
+            }
         }
+        assert!(peak > 1.01 && peak < 1.04, "轻微过冲应约 2%: {peak}");
+        assert!((0.6..0.8).contains(&peak_t), "峰值时刻应在中后段: {peak_t}");
+        // 中前段保持陡峭：25% 时间至少走完 70%
+        assert!(ease_out_back(0.25) > 0.70);
+        // 过冲后回落，终点精确回到目标
+        assert!(ease_out_back(0.9) < peak);
     }
 
     // ---- 高度缓动帧数学纯函数（消卡顿改造）----
