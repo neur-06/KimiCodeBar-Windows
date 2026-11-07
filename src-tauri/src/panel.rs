@@ -105,6 +105,19 @@ impl TrayRect {
             height,
         }
     }
+
+    /// 托盘 rect 是否可用于定位：图标必然有非零尺寸，坐标也不会是哨兵值。
+    /// tray-icon 在图标未就绪 / 任务栏重建 / DPI 切换时可能返回 0×0 或异常坐标；
+    /// 若直接代入 `anchored_panel_pos`，`x = tray.x + tray.width/2 - win_w/2` 会算出
+    /// 大负数，再被 clamp 到屏幕左缘——面板「向左跳一大截」就是这么来的。
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width <= 4096
+            && self.height <= 4096
+            && self.x.unsigned_abs() <= 100_000
+            && self.y.unsigned_abs() <= 100_000
+    }
 }
 
 /// 显示器几何快照（物理像素）：定位/动画启动时查询一次缓存，帧内不再做系统查询。
@@ -141,6 +154,11 @@ fn anchored_panel_pos(
     win_w: i32,
     win_h: i32,
 ) -> (i32, i32) {
+    // 尺寸必须是正数且不超过屏幕：读到 0/负数/异常大的外框值时，居中结果会飞出屏幕，
+    // 随后 clamp 到左缘（视觉上就是「向左跳一大截」）。入口先收口，异常值按屏幕可用
+    // 尺寸兜底，保证 x 始终落在显示器内。
+    let win_w = win_w.max(1);
+    let win_h = win_h.max(1);
     let mut x = tray.x + tray.width / 2 - win_w / 2;
     let mut y = tray.y - win_h - EDGE_MARGIN;
     if let Some(m) = mon {
@@ -148,6 +166,12 @@ fn anchored_panel_pos(
         if y < m.y + EDGE_MARGIN {
             y = tray.y + tray.height + EDGE_MARGIN;
         }
+        let avail_w = m.w.saturating_sub(2 * EDGE_MARGIN).max(1);
+        let avail_h = m.h.saturating_sub(2 * EDGE_MARGIN).max(1);
+        let win_w = win_w.min(avail_w);
+        let win_h = win_h.min(avail_h);
+        // 用收口后的尺寸重算居中（异常大的宽度不能把面板推到屏幕左缘）
+        x = tray.x + tray.width / 2 - win_w / 2;
         let min_x = m.x + EDGE_MARGIN;
         let max_x = (m.x + m.w - win_w - EDGE_MARGIN).max(min_x);
         let min_y = m.y + EDGE_MARGIN;
@@ -356,6 +380,21 @@ pub fn show_panel(app: &AppHandle, tray: TrayRect) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
+    // 托盘 rect 异常（0×0 / 哨兵坐标）时不做定位：`x = tray.x + tray.width/2 - win_w/2`
+    // 会算出大负数并被 clamp 到屏幕左缘（面板「向左跳一大截」）。保持上次几何，
+    // 等下一次拿到有效 rect 再校准；region 也不能清，否则会露出完整矩形点击区。
+    if !tray.is_valid() {
+        tracing::warn!(
+            "show_panel: invalid tray rect ({},{},{}x{}), keep current geometry",
+            tray.x,
+            tray.y,
+            tray.width,
+            tray.height
+        );
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
     // 开窗前校准必须瞬时（面板一出现就是对的尺寸，不播动画）；
     // fit 返回 true 时尺寸 + 位置已原子完成，不再重复定位（少一次 getter 往返）
     if !fit_panel_to_screen(app, &window, tray, false) {
@@ -483,6 +522,12 @@ fn fit_panel_to_screen(
     let Some(conf) = app.config().app.windows.iter().find(|w| w.label == "main") else {
         return false;
     };
+    // 兜底防御：异常托盘 rect 会让 x 算出大负数并被 clamp 到屏幕左缘。调用方通常已
+    // 过滤（show_panel / refit / second_instance），这里再挡一次，任何新调用路径都安全。
+    if !tray.is_valid() {
+        tracing::warn!("panel fit: invalid tray rect, keep current geometry");
+        return false;
+    }
     let Ok(Some(monitor)) = app.monitor_from_point(tray.x as f64, tray.y as f64) else {
         tracing::warn!(
             "panel fit: monitor_from_point failed for tray ({}, {})",
@@ -654,9 +699,10 @@ pub fn refit_open_panel(app: &AppHandle, animate: bool) {
         .tray_by_id(crate::tray::TRAY_ID)
         .and_then(|tray| tray.rect().ok().flatten())
         .map(|rect| TrayRect::new(rect.position, rect.size))
+        .filter(TrayRect::is_valid)
     else {
-        tracing::warn!("panel refit: tray rect unavailable, skip");
-        return; // 取不到托盘位置：不动，下次打开面板时自然会校准
+        tracing::warn!("panel refit: tray rect unavailable or invalid, skip");
+        return; // 取不到/取到异常托盘位置：不动，下次打开面板时自然会校准
     };
     // fit 返回 true：瞬时路径已完成「尺寸 + 位置」、或动画已启动（首帧即原子定位）；
     // 仅尺寸已接近目标 / 取不到配置或显示器时才走 position_panel 兜底（幂等）
@@ -671,7 +717,8 @@ pub fn show_panel_for_second_instance(app: &AppHandle) {
     let tray_rect = app
         .tray_by_id(crate::tray::TRAY_ID)
         .and_then(|tray| tray.rect().ok().flatten())
-        .map(|rect| TrayRect::new(rect.position, rect.size));
+        .map(|rect| TrayRect::new(rect.position, rect.size))
+        .filter(TrayRect::is_valid);
     match tray_rect {
         Some(tray) => show_panel(app, tray),
         None => {
@@ -689,18 +736,40 @@ pub fn show_panel_for_second_instance(app: &AppHandle) {
 /// 锚定用外框尺寸（`set_position` 是 outer 坐标，与动画帧同一基准）；系统查询只在此处
 /// 发生一次，翻转与 clamp 数学走 anchored_panel_pos 纯函数。
 fn position_panel(app: &AppHandle, window: &WebviewWindow, tray: TrayRect) {
+    // 托盘 rect 异常时不定位：拿它算 x 会把面板推到屏幕左缘（见 TrayRect::is_valid）。
+    if !tray.is_valid() {
+        tracing::warn!(
+            "position_panel: invalid tray rect ({},{},{}x{}), keep current position",
+            tray.x,
+            tray.y,
+            tray.width,
+            tray.height
+        );
+        return;
+    }
     // 读不到外框尺寸就不动：绝不能按 0×0 锚定（那会把窗口顶边锚到托盘上方 8px、
     // 主体盖住托盘图标，比保持原位更糟）；下次 show/refit 会重新校准。
     let Some((_, outer)) = window_sizes(window) else {
         return;
     };
-    let (win_w, win_h) = (outer.width as i32, outer.height as i32);
-    let mon = app
+    let monitor = app
         .monitor_from_point(tray.x as f64, tray.y as f64)
         .ok()
-        .flatten()
-        .map(|m| monitor_geom(&m));
-    let (x, y) = anchored_panel_pos(tray, mon, win_w, win_h);
+        .flatten();
+    let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
+    // 宽度从配置推导（窗口宽 = 配置宽 + 两侧自绘外框），不用外框回读值：
+    // 窗口隐藏 / 刚 SetWindowPos 后读到过期缓存是横向跳变的来源之一；高度仍需实测
+    // （随内容变化），只用于底部锚定。
+    let win_w = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .map(|conf| frame_height_px(conf.width + 2.0 * FRAME_PAD, scale) as i32)
+        .unwrap_or(outer.width as i32);
+    let win_h = outer.height as i32;
+    let (x, y) = anchored_panel_pos(tray, monitor.as_ref().map(monitor_geom), win_w, win_h);
     let _guard = lock_panel_win();
     // 在播高度动画每帧都会重定位：此处让路，避免「第 0 帧按当前尺寸定位、首帧按
     // 目标尺寸锚定」交叉造成的一帧跳动（动画结束会清 target，后续定位照常）。
@@ -878,6 +947,37 @@ mod tests {
             anchored_panel_pos(tray(900, 0, 40, 40), None, 360, 500),
             (740, -508)
         );
+    }
+
+    /// 托盘 rect 有效性：0×0 / 异常大 / 哨兵坐标都不可用于定位（否则 x 会算出大负数
+    /// 并被 clamp 到屏幕左缘，即「向左跳一大截」）
+    #[test]
+    fn tray_rect_validity_rejects_degenerate_values() {
+        assert!(tray(900, 1000, 40, 40).is_valid());
+        assert!(!tray(0, 0, 0, 0).is_valid());
+        assert!(!tray(900, 1000, 0, 40).is_valid());
+        assert!(!tray(900, 1000, 40, 0).is_valid());
+        assert!(!tray(900, 1000, 5000, 40).is_valid());
+        assert!(!tray(i32::MIN, 1000, 40, 40).is_valid());
+        assert!(!tray(900, i32::MAX, 40, 40).is_valid());
+    }
+
+    /// 异常窗口尺寸（0 / 负数 / 远超屏幕）不能让 x 越界或被推到屏幕左缘
+    #[test]
+    fn anchored_pos_survives_degenerate_window_size() {
+        let m = mon(0, 0, 1920, 1080);
+        // 宽度读到 0 或负数：按 1px 居中 → 托盘中心 920，绝不贴左缘
+        assert_eq!(
+            anchored_panel_pos(tray(900, 1000, 40, 40), m, 0, 500).0,
+            920
+        );
+        assert_eq!(
+            anchored_panel_pos(tray(900, 1000, 40, 40), m, -360, 500).0,
+            920
+        );
+        // 宽度异常超大：收口到屏幕可用宽，x 仍在屏内
+        let x = anchored_panel_pos(tray(900, 1000, 40, 40), m, 5000, 500).0;
+        assert!((8..=1912).contains(&x), "x out of screen: {x}");
     }
 
     /// 目标防抖：无在播目标（位模式 0）一律放行；差 < 4 逻辑 px 忽略；≥ 4 顶掉重播
